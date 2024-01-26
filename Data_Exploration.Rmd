@@ -1,0 +1,509 @@
+---
+title: "Energy Data Exploration"
+author: "Keenan Wallace"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(mosaic)
+```
+
+# Load Datasets
+
+```{r} 
+train <- read_csv("data/train.csv") 
+mapping <- read_csv("data/weather_station_to_county_mapping.csv")
+historical_weather <- read_csv("data/historical_weather.csv")
+client <- read_csv("data/client.csv")
+gas_prices <- read_csv("data/gas_prices.csv")
+electricity_prices <- read_csv("data/electricity_prices.csv")
+forecast_weather <- read_csv("data/forecast_weather.csv")
+```
+
+# Separate train data
+
+```{r}
+train2 <- separate(train, datetime, c("date", "time"), sep = " ")
+production <- train[train$row_id%%2 == 0,]
+consumption <- train[train$row_id%%2 != 0,]
+```
+
+# Boxplots
+
+Looking at only noon of train data(high production time)
+```{r}
+production <- train2[train2$row_id%%2 == 0,]
+consumption <- train2[train2$row_id%%2 != 0,]
+noonproduction <- production[production$time == "12:00:00",]
+noonconsumption <- production[production$time == "12:00:00",]
+np2 <- noonproduction[noonproduction$target < 1000,]
+nc2 <- noonconsumption[noonconsumption$target < 5000,]
+boxplot(np2$target~np2$is_business)
+boxplot(nc2$target~nc2$is_business)
+boxplot(np2$target~np2$product_type)
+boxplot(nc2$target~nc2$product_type)
+```
+
+At noon, there doesn't appear to be a particularly obvious difference in consumption or production(target) between businesses and non businesses, but there are more obvious differences between product types and consumption/production levels, such as clients with product type 3 tending to produce and consume more than other types.
+
+```{r}
+hist(noonproduction$target)
+favstats(noonproduction$target)
+```
+
+
+# Data set reduction for graphing(looking at production)
+
+I tried narrowing down the scope to only times in historical weather when there is solar radiation and the coordinates are in county 3, and narrowed the train(explore) data down only in region 3, production, when production is actually occurring
+
+There are now considerably fewer cases in each
+
+```{r}
+train <- read_csv("data/train.csv") 
+explore <- train[train$county == 3,] #used later
+
+historical_weather_sun <- historical_weather[historical_weather$direct_solar_radiation >0,]
+historical_weather_sun3 <- historical_weather_sun[historical_weather_sun$latitude == 58.8
+      & historical_weather_sun$longitude == 25.7,]
+explore_production <- production[production$county == 3,]
+explore_production_y <- explore_production[explore_production$target>0,]
+explore_production_y$year <- format(explore_production_y$datetime, "%Y")
+historical_weather_sun3$year <- format(historical_weather_sun3$datetime, "%Y")
+historical_weather_sun3_2022 <- historical_weather_sun3[historical_weather_sun3$year==2022,]
+explore_production_y_2022 <- na.omit(explore_production_y[explore_production_y$year==2022,])
+
+historical_weather_3 <- historical_weather[historical_weather$latitude == 58.8
+      & historical_weather$longitude == 25.7,]  #used later
+
+```
+
+# Preliminary Merging
+
+
+```{r}
+# Merging weather(cloudcover) into explore by datetime
+explore_cloud <- left_join(explore, historical_weather_3 %>% distinct(datetime, cloudcover_total,temperature), by = "datetime")
+
+# Merge gas prices
+mgasprice <- gas_prices
+mgasprice$data_block_id <- gas_prices$data_block_id - 1
+explore_cloud <- left_join(explore_cloud, mgasprice %>% distinct(data_block_id, lowest_price_per_mwh, highest_price_per_mwh), by = "data_block_id")
+
+#Merge electricity prices
+electricity_prices$forecast_date <- as.POSIXct(electricity_prices$forecast_date, format = "%m/%d/%y %H:%M")
+electricity_prices$datetime <- electricity_prices$forecast_date
+explore_cloud <- left_join(explore_cloud, electricity_prices %>% distinct(datetime, euros_per_mwh), by = "datetime")
+```
+
+# Plots (for region 3)
+
+
+## Production
+
+```{r}
+explore <- explore_cloud
+explore_production <- explore[explore$row_id%%2 == 0,]
+explore_consumption <- explore[explore$row_id%%2 != 0,]
+vars <- explore_production[,c("target", "cloudcover_total", "temperature","lowest_price_per_mwh", "highest_price_per_mwh", "euros_per_mwh")]
+
+plot(explore_production$target ~ explore_production$cloudcover_total)
+plot(explore_production$target ~ explore_production$temperature)
+plot(explore_production$target ~ explore_production$lowest_price_per_mwh)#gas
+plot(explore_production$target ~ explore_production$euros_per_mwh)#electricity
+
+```
+
+There appears to be some relationship between temperature and production, with higher production values present as temperature increases. Patterns are less clear/present for cloudcover and gas and electricity prices
+
+## Consumption
+
+```{r}
+plot(explore_consumption$target ~ explore_consumption$cloudcover_total)
+plot(explore_consumption$target ~ explore_consumption$temperature)
+plot(explore_consumption$target ~ explore_consumption$lowest_price_per_mwh)#gas
+plot(explore_consumption$target ~ explore_consumption$euros_per_mwh, xlim = c(0,1100))#electricity
+```
+
+Some interesting pattern can be observed in the consumption plots. To different degrees, their trend appear to be split into two different groups. This is especially apparent in the target vs temperature plot.
+
+## Searching for cause of consumption split
+
+### separate day and night
+
+A rough separation of approximately when daylight may be present
+
+```{r}
+explore_consumption2 <- separate(explore_consumption, datetime, c("date", "time"), sep = " ")
+explore_consumption2$time <- as.POSIXct(explore_consumption2$time, format = "%H:%M:%S")
+day <- seq(from = as.POSIXct("07:00:00", format = "%H:%M:%S"), to = as.POSIXct("17:00:00", format = "%H:%M:%S"), by = "1 hour")
+plot(explore_consumption2$target ~ explore_consumption2$cloudcover_total,col =  ifelse(explore_consumption2$time %in% day,"red","blue"))
+legend("topleft", legend = c("Day", "Night"), 
+       col = c("red", "blue"), pch = 15)
+plot(explore_consumption$target ~ explore_consumption$temperature,col =  ifelse(explore_consumption2$time %in% day,"red","blue"))
+plot(explore_consumption$target ~ explore_consumption$lowest_price_per_mwh,col =  ifelse(explore_consumption2$time %in% day,"red","blue"))#gas
+plot(explore_consumption$target ~ explore_consumption$euros_per_mwh)#electricity
+```
+
+Some disparities between the patterns of night and day can be observed, but they fail to explain the split in the data and only accentuate it.
+
+
+### Separate winter and summer
+
+Once again, a rough separation to get a rough idea of the trends. Considers May through September to be summer, and everything else winter.
+
+```{r}
+explore_consumption3 <- separate(explore_consumption2, date, c("year", "month", "day"), sep = "-")
+explore_consumption3$month <- as.numeric(explore_consumption3$month)
+summer <- 5:9
+plot(explore_consumption3$target ~ explore_consumption3$cloudcover_total,col =  ifelse(explore_consumption3$month %in% summer,"red","blue"))
+legend("topleft", legend = c("Summer", "Else"), 
+       col = c("red", "blue"), pch = 15)
+plot(explore_consumption3$target ~ explore_consumption3$temperature,col =  ifelse(explore_consumption3$month %in% summer,"red","blue"))
+plot(explore_consumption3$target ~ explore_consumption3$lowest_price_per_mwh,col =  ifelse(explore_consumption3$month %in% summer,"red","blue"))#gas
+plot(explore_consumption$target ~ explore_consumption$euros_per_mwh)#electricity
+```
+
+Once again, there are some trends, but none which explain the split.
+
+### Separate is_business
+
+```{r}
+plot(explore_consumption$target ~ explore_consumption$cloudcover_total,col =  ifelse(explore_consumption$is_business == 1,"green", "orange"))
+legend("topleft", legend = c("Business", "Else"), 
+       col = c("green", "orange"), pch = 15)
+plot(explore_consumption$target ~ explore_consumption$temperature,col =  ifelse(explore_consumption$is_business == 1,"green", "orange"))
+plot(explore_consumption$target ~ explore_consumption$lowest_price_per_mwh,col =  ifelse(explore_consumption$is_business == 1,"green", "orange"))#gas
+plot(explore_consumption$target ~ explore_consumption$euros_per_mwh)#electricity
+```
+
+
+Here, particularly with temperature and gas price, there is a clearly observable split between clients that are and are not businesses. Those which are not businesses tend to consume much less energy while still following the overall trend(ex.decreasing) on a much smaller scale.
+
+# Time Series Plots
+
+```{r}
+train <- read_csv("data/train.csv") 
+production <- train[train$row_id%%2 == 0,]
+consumption <- train[train$row_id%%2 != 0,]
+```
+
+## Consumption vs Production
+
+```{r}
+production$datetime2 <- as.POSIXct(production$datetime, format = "%Y-%m-%d %H:%M:%S")
+consumption$datetime2 <- as.POSIXct(consumption$datetime, format = "%Y-%m-%d %H:%M:%S")
+plot(consumption$datetime2, consumption$target, type = "l", xlab = "Date", ylab = "Target", 
+     main = "Energy Use(Target) by Date", col = rgb(1,0,0, alpha = 0.05))
+
+
+lines(production$datetime2, production$target, col = rgb(0,0,1, alpha = 0.05))
+legend("topleft", legend = c("Consumption", "Production"), 
+       col = c(rgb(1, 0, 0, alpha = 0.5), rgb(0, 0, 1, alpha = 0.5)), pch = 15)
+```
+
+With this plot, it is clear that consumption and production highs alternate by season, with production being higher in the summer months and lower in the winter, while consumption is higher in the winter and lower in the summer.
+
+This follows the sort of trends one would expect from Estonia.
+
+## Is business vs not 
+
+### Consumption
+```{r}
+consumption_b <- consumption[consumption$is_business == 1,]
+consumption_n <- consumption[consumption$is_business == 0,]
+consumption_b$datetime2 <- as.POSIXct(consumption_b$datetime, format = "%Y-%m-%d %H:%M:%S")
+consumption_n$datetime2 <- as.POSIXct(consumption_n$datetime, format = "%Y-%m-%d %H:%M:%S")
+plot(consumption_b$datetime2, consumption_b$target, type = "l", xlab = "Date", ylab = "Target", 
+     main = "Energy Consumption(Target) by Date", col = rgb(1,0,0, alpha = 0.05))
+
+
+lines(consumption_n$datetime2, consumption_n$target, col = rgb(0,0,1, alpha = 0.05))
+legend("topleft", legend = c("Business", "Not"), 
+       col = c(rgb(1, 0, 0, alpha = 0.5), rgb(0, 0, 1, alpha = 0.5)), pch = 15)
+```
+
+Similar to the trends seen before, businesses and non businesses follow similar trends as far as ups and downs go, but the scale of the consumption is much higher for businesses.
+
+
+### Production
+```{r}
+production_b <- production[production$is_business== 1,]
+production_n <- production[production$is_business== 0,]
+production_b$datetime2 <- as.POSIXct(production_b$datetime, format = "%Y-%m-%d %H:%M:%S")
+production_n$datetime2 <- as.POSIXct(production_n$datetime, format = "%Y-%m-%d %H:%M:%S")
+plot(production_b$datetime2, production_b$target, type = "l", xlab = "Date", ylab = "Target", 
+     main = "Energy Production(Target) by Date", col = rgb(1,0,0, alpha = 0.05))
+
+
+lines(production_n$datetime2, production_n$target, col = rgb(0,0,1, alpha = 0.05))
+legend("topleft", legend = c("Business", "Not"), 
+       col = c(rgb(1, 0, 0, alpha = 0.5), rgb(0, 0, 1, alpha = 0.5)), pch = 15)
+```
+
+Whether a client is or is not a business appears to have little effect on energy production.
+
+## Weekly trends
+
+
+### Consumption and production, September 1-8, 2021
+```{r}
+littleproduction <- production[1:9000,]
+littleconsumption <- consumption[1:9000,]
+plot(littleconsumption$datetime2, littleconsumption$target, type = "l", xlab = "Date(Sep 1-8, 2021)", ylab = "Target", 
+     main = "Energy Use(Target) by Date", col = rgb(1,0,0, alpha = 0.5))
+
+
+lines(littleproduction$datetime2, littleproduction$target, col = rgb(0,0,1, alpha = 0.5))
+legend("topleft", legend = c("Consumption", "Production"), 
+       col = c(rgb(1, 0, 0, alpha = 0.5), rgb(0, 0, 1, alpha = 0.5)), pch = 15)
+```
+
+Production shows clear peaks at midday, reducing to 0 at night, while consumption follows a less clear pattern but remains fairly consistently high throughout the week, though with some dips and spikes.
+
+
+### Consumption and production, July 1-8, 2022
+```{r}
+starttime <- as.POSIXct("2022-07-01 00:00:00", format = "%Y-%m-%d %H:%M:%S")
+endtime <- as.POSIXct("2022-07-07 00:00:00", format = "%Y-%m-%d %H:%M:%S")
+plot(consumption$datetime2, consumption$target, type = "l", xlab = "Date(July 1-8, 2022)", ylab = "Target", 
+     main = "Energy Use(Target) by Date", col = rgb(1,0,0, alpha = 0.5), xlim = c(starttime,endtime))
+
+
+lines(production$datetime2, production$target, col = rgb(0,0,1, alpha = 0.5))
+legend("topleft", legend = c("Consumption", "Production"), 
+       col = c(rgb(1, 0, 0, alpha = 0.5), rgb(0, 0, 1, alpha = 0.5)), pch = 15)
+axis(1, at = seq(from = starttime, to = endtime, by = "days"), 
+     labels = seq(from = starttime, to = endtime, by = "days"), cex.axis = 0.8)
+```
+
+Similar trends to September 2021
+
+
+# Looking at client
+```{r}
+client_3 <- client[client$county == 3,] #there are 4 clients listed in county 3
+exploresp <- separate(explore, datetime, c("date", "time"), sep = " ")
+
+exploresp$date <- as.POSIXct(exploresp$date, format = "%Y-%m-%d")
+client_3date <- as.POSIXct(client$date, format = "%Y-%m-%d")
+
+explore_client <- left_join(exploresp, client_3 %>% distinct(date, is_business, product_type, eic_count, installed_capacity), by = c("date", "is_business", "product_type"))
+
+expclient_pro <- explore_client[explore_client$is_consumption%%2 == 0,]
+plot(expclient_pro$target ~ expclient_pro$eic_count)
+plot(expclient_pro$target ~ expclient_pro$installed_capacity) #***
+```
+
+As one would expect, the higher the installed capacity, the higher the production can potentially be, leading to the patterned observed. A similar principle applies to EIC count. The bands likely result from each client having the same count/value for a number of different times before changing and maintaining that value for a while.
+
+## Merging train and client
+
+```{r}
+train$datetime2 <- train$datetime
+train <- separate(train, datetime2, c("date", "time"), sep = " ")
+
+train$date <- as.POSIXct(train$date, format = "%Y-%m-%d")
+
+train <- left_join(train, client %>% distinct(date, is_business, county, product_type, eic_count, installed_capacity), by = c("date", "is_business", "product_type", "county"))
+```
+
+```{r}
+production <- train[train$row_id%%2 == 0,]
+consumption <- train[train$row_id%%2 != 0,]
+```
+
+```{r}
+plot(eic_count ~ installed_capacity, data = client)
+```
+
+```{r}
+
+plot(target ~ eic_count, data = production, main = "Production vs EIC")
+plot(target ~ installed_capacity, data = production, main = "Production vs Installed Capacity")
+
+plot(target ~ eic_count, data = consumption, main = "Consumption vs EIC")
+plot(target ~ installed_capacity, data = consumption, main = "Consumption vs Installed Capacity")
+
+```
+
+Looking at installed capacity and eic count, it appears there may be some interaction with another variable in explaining consumption.
+
+```{r}
+plot(target ~ eic_count, data = consumption, main = "Consumption vs EIC", col =  ifelse(consumption$is_business == 1,"green", "orange"))
+legend("topleft", legend = c("Business", "Else"), 
+       col = c("green", "orange"), pch = 15)
+
+plot(target ~ installed_capacity, data = consumption, main = "Consumption vs Installed Capacity", col =  ifelse(consumption$is_business == 1,"green", "orange"))
+```
+
+Here it's clear that there is interaction between is_business and installed_capacity/eic_count in explaining consumption
+
+# Data Merging
+
+
+```{r}
+# merge with historical weather
+historical_weather$latitude <- round(historical_weather$latitude,1)
+historical_weather$longitude <- round(historical_weather$longitude,1)
+hweather <- left_join(historical_weather, mapping %>% distinct(longitude, latitude, county), by = c("longitude", "latitude"))
+hweather <- na.omit(hweather)
+
+# aggregate temperatures by date and region
+hweather$total_precipitation <- hweather$snowfall/10 + hweather$rain
+
+hweather_av <- hweather %>% 
+  group_by(datetime, county) %>% 
+  summarize(temperature = mean(temperature))
+hweather_rad <- hweather %>% 
+  group_by(datetime, county) %>%  
+  summarize(direct_solar_radiation = mean(direct_solar_radiation))
+hweather_prec <- hweather %>% 
+  group_by(datetime, county) %>%
+  summarize(total_precipitation = mean(total_precipitation))
+hweather_dew <- hweather %>% 
+  group_by(datetime, county) %>%
+  summarize(dewpoint = mean(dewpoint))
+hweather_av$direct_solar_radiation <- hweather_rad$direct_solar_radiation
+hweather_av$total_precipitation <- hweather_prec$total_precipitation
+hweather_av$dewpoint <- hweather_dew$dewpoint
+
+# add temp to train
+train_hist <- left_join(train, hweather_av, by = c("county", "datetime"))
+train_hist <- na.omit(train_hist)
+```
+
+## explore
+
+```{r}
+production_hist <- train_hist[train_hist$row_id%%2 == 0,]
+consumption_hist <- train_hist[train_hist$row_id%%2 != 0,]
+```
+
+```{r}
+plot(production_hist$target ~ production_hist$temperature, col =  ifelse(production_hist$is_business == 1,"green", "orange"))
+legend("topleft", legend = c("Business", "Else"), 
+       col = c("green", "orange"), pch = 15)
+```
+
+```{r}
+plot(consumption_hist$target ~ consumption_hist$temperature, col =  ifelse(consumption_hist$is_business == 1,"green", "orange"))
+legend("topleft", legend = c("Business", "Else"), 
+       col = c("green", "orange"), pch = 15)
+```
+
+# consumption weather graphs
+```{r}
+plot(consumption_hist$target ~ consumption_hist$temperature)
+plot(consumption_hist$target ~ consumption_hist$direct_solar_radiation)
+plot(consumption_hist$target ~ consumption_hist$total_precipitation)
+plot(consumption_hist$target ~ consumption_hist$dewpoint)
+```
+
+
+## production weather graphs
+```{r}
+plot(production_hist$target ~ production_hist$temperature)
+plot(production_hist$target ~ production_hist$direct_solar_radiation)
+plot(production_hist$target ~ production_hist$total_precipitation)
+plot(production_hist$target ~ production_hist$dewpoint)
+```
+
+## historical weather regression
+```{r}
+hcon_lm <- lm(target ~ temperature + direct_solar_radiation + total_precipitation + dewpoint, data = consumption_hist)
+summary(hcon_lm)
+hprod_lm <- lm(target ~ temperature + direct_solar_radiation + total_precipitation + dewpoint, data = production_hist)
+summary(hprod_lm)
+```
+
+# Merging forecast weather
+
+```{r}
+# orgainize mapping file
+mapping <- na.omit(mapping)
+mapping$longitude <- round(mapping$longitude,1)
+mapping$latitude <- round(mapping$latitude,1)
+
+# merge with forecast weather
+forecast_weather$latitude <- round(forecast_weather$latitude,1)
+forecast_weather$longitude <- round(forecast_weather$longitude,1)
+fweather <- left_join(forecast_weather, mapping %>% distinct(longitude, latitude, county), by = c("longitude", "latitude"))
+fweather <- na.omit(fweather)
+
+# aggregate temperatures by date and region
+fweather_av <- fweather %>% 
+  group_by(forecast_datetime, county) %>% 
+  summarize(temperature = mean(temperature))
+fweather_rad <- fweather %>% 
+  group_by(forecast_datetime, county) %>%  
+  summarize(direct_solar_radiation = mean(direct_solar_radiation))
+fweather_prec <- fweather %>% 
+  group_by(forecast_datetime, county) %>%
+  summarize(total_precipitation = mean(total_precipitation))
+fweather_dew <- fweather %>% 
+  group_by(forecast_datetime, county) %>%
+  summarize(dewpoint = mean(dewpoint))
+fweather_av$direct_solar_radiation <- fweather_rad$direct_solar_radiation
+fweather_av$total_precipitation <- fweather_prec$total_precipitation
+fweather_av$dewpoint <- fweather_dew$dewpoint
+
+# add temp to train
+train_for <- train
+train_for$forecast_datetime <- train_for$datetime
+train_for <- left_join(train_for, fweather_av, by = c("county", "forecast_datetime"))
+train_for <- na.omit(train_for)
+```
+
+
+## explore
+
+```{r}
+production_for <- train_for[train_for$row_id%%2 == 0,]
+consumption_for <- train_for[train_for$row_id%%2 != 0,]
+```
+
+```{r}
+plot(production_for$target ~ production_for$temperature, col =  ifelse(production_for$is_business == 1,"green", "orange"))
+legend("topleft", legend = c("Business", "Else"), 
+       col = c("green", "orange"), pch = 15)
+```
+
+```{r}
+plot(consumption_for$target ~ consumption_for$temperature, col =  ifelse(consumption_for$is_business == 1,"green", "orange"))
+legend("topleft", legend = c("Business", "Else"), 
+       col = c("green", "orange"), pch = 15)
+```
+
+## consumption weather graphs
+```{r}
+plot(consumption_for$target ~ consumption_for$temperature)
+plot(consumption_for$target ~ consumption_for$direct_solar_radiation)
+plot(consumption_for$target ~ consumption_for$total_precipitation)
+plot(consumption_for$target ~ consumption_for$dewpoint)
+```
+
+## production weather graphs
+```{r}
+plot(production_for$target ~ production_for$temperature)
+plot(production_for$target ~ production_for$direct_solar_radiation)
+plot(production_for$target ~ production_for$total_precipitation)
+plot(production_for$target ~ production_for$dewpoint)
+```
+
+## forecast weather regression
+```{r}
+fcon_lm <- lm(target ~ temperature + direct_solar_radiation + total_precipitation + dewpoint, data = consumption_for)
+summary(fcon_lm)
+fprod_lm <- lm(target ~ temperature + direct_solar_radiation + total_precipitation + dewpoint, data = production_for)
+summary(fprod_lm)
+```
+
+
+
+

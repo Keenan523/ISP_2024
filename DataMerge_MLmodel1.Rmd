@@ -1,0 +1,368 @@
+---
+title: "Energy Data Merge V1"
+author: "Keenan Wallace"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(car)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(mosaic)
+library(lubridate)
+library(tidyverse)
+library(randomForest)
+library(caret)
+```
+
+# Load Datasets
+
+```{r} 
+train <- read_csv("data/train.csv") 
+mapping <- read_csv("data/weather_station_to_county_mapping.csv")
+historical_weather <- read_csv("data/historical_weather.csv")
+client <- read_csv("data/client.csv")
+gas_prices <- read_csv("data/gas_prices.csv")
+electricity_prices <- read_csv("data/electricity_prices.csv")
+forecast_weather <- read_csv("data/forecast_weather.csv")
+```
+
+# Separate Train and Test Sets
+
+```{r}
+test <- train[train$data_block_id >= 634,]
+train <- train[train$data_block_id < 634,]
+#Last data blocks of the time series(634-637) separated as test set
+```
+
+
+
+# Testing Data
+
+## Weather Aggregation by Region
+
+### Round
+```{r}
+mapping <- na.omit(mapping)
+mapping$longitude <- round(mapping$longitude,1)
+mapping$latitude <- round(mapping$latitude,1)
+#eliminate infinite values
+```
+
+### Merge region mapping with forecast weather
+
+```{r}
+forecast_weather$latitude <- round(forecast_weather$latitude,1)
+forecast_weather$longitude <- round(forecast_weather$longitude,1) #eliminate infinite values
+fweather <- left_join(forecast_weather, mapping %>% distinct(longitude, latitude, county), by = c("longitude", "latitude")) #map county to longitude & latitude in fweather
+fweather <- na.omit(fweather)
+```
+
+### Aggregate temperatures by date and region
+
+```{r}
+#Summarize weather data across coordinates in each county by the hour
+fweather_av <- fweather %>% 
+  group_by(origin_datetime, forecast_datetime, county) %>% 
+  summarize(temperature = mean(temperature)) 
+fweather_rad <- fweather %>% 
+  group_by(origin_datetime, forecast_datetime, county) %>%  
+  summarize(direct_solar_radiation = mean(direct_solar_radiation))
+fweather_prec <- fweather %>% 
+  group_by(origin_datetime, forecast_datetime, county) %>%
+  summarize(total_precipitation = mean(total_precipitation))
+fweather_dew <- fweather %>% 
+  group_by(origin_datetime, forecast_datetime, county) %>%
+  summarize(dewpoint = mean(dewpoint))
+fweather_data_id <- fweather %>% 
+  group_by(origin_datetime) %>%
+  summarize(data_block_id = mean(data_block_id))
+
+# Merge the datasets into fweather_av
+fweather_av$direct_solar_radiation <- fweather_rad$direct_solar_radiation
+fweather_av$total_precipitation <- fweather_prec$total_precipitation
+fweather_av$dewpoint <- fweather_dew$dewpoint
+fweather_av <- left_join(fweather_av, fweather_data_id, by = "origin_datetime")
+fweather_av <- left_join(fweather_av, fweather %>% distinct(origin_datetime, hours_ahead, forecast_datetime), by = c("origin_datetime", "forecast_datetime"))
+```
+
+For the test set, I am using forecast data as the true weather data will not be available when making the prediction.
+
+## Merge forecast weather with test data
+
+```{r}
+test_weather <- fweather_av[fweather_av$data_block_id >= 634,]
+test_weather <- test_weather %>% rename(datetime = forecast_datetime)
+test <- left_join(test, test_weather, by = c("data_block_id", "datetime", "county"))
+```
+
+
+## Merge Client with Test
+```{r}
+test <- left_join(test, client %>% distinct(data_block_id, is_business, county, product_type, eic_count, installed_capacity), by = c("data_block_id", "is_business", "product_type", "county"))
+```
+
+
+## Merge Gas Prices with Test
+```{r}
+test <- left_join(test, gas_prices %>% distinct(data_block_id, lowest_price_per_mwh, highest_price_per_mwh), by = "data_block_id")
+```
+
+## Merge Electricity Prices with Test
+```{r}
+electricity_prices <- separate(electricity_prices, forecast_date, c("date", "time"), sep = " ")
+electricity_prices <- electricity_prices[electricity_prices$time == "10:00",]
+test <- left_join(test, electricity_prices %>% distinct(data_block_id, euros_per_mwh), by = "data_block_id")
+```
+
+Only electricity prices available at 10:00am the day prior will be used for the next day's prediction, as predictions are made at 11am.
+
+```{r}
+test <- na.omit(test)
+```
+
+192 rows omitted of 12480
+
+
+# Train
+
+## Historical weather aggregation by region
+
+### Merge mapping file with with historical weather
+```{r}
+historical_weather$latitude <- round(historical_weather$latitude,1)
+historical_weather$longitude <- round(historical_weather$longitude,1)
+hweather <- left_join(historical_weather, mapping %>% distinct(longitude, latitude, county), by = c("longitude", "latitude"))
+hweather <- na.omit(hweather)
+```
+
+### Aggregate historical weather by date and region
+
+```{r}
+hweather$total_precipitation <- hweather$snowfall/10 + hweather$rain
+#to keep factors consistent between historical and forecast weather
+
+#Summarize weather data across coordinates in each county by the hour
+hweather_av <- hweather %>% 
+  group_by(datetime, county) %>% 
+  summarize(temperature = mean(temperature))
+hweather_rad <- hweather %>% 
+  group_by(datetime, county) %>%  
+  summarize(direct_solar_radiation = mean(direct_solar_radiation))
+hweather_prec <- hweather %>% 
+  group_by(datetime, county) %>%
+  summarize(total_precipitation = mean(total_precipitation))
+hweather_dew <- hweather %>% 
+  group_by(datetime, county) %>%
+  summarize(dewpoint = mean(dewpoint))
+
+#Merge the datasets into hweather_av
+hweather_av$direct_solar_radiation <- hweather_rad$direct_solar_radiation
+hweather_av$total_precipitation <- hweather_prec$total_precipitation
+hweather_av$dewpoint <- hweather_dew$dewpoint
+```
+
+## Merge weather to train
+```{r}
+train <- left_join(train, hweather_av, by = c("county", "datetime"))
+```
+
+Historical data is merged only by county and datetime as the true weather for each time will be used to train the data, rather than a forecast prediction like is used in test.
+
+## Merge client to train
+```{r}
+train$datetime2 <- train$datetime
+train <- separate(train, datetime2, c("date", "time"), sep = " ")
+
+train$date <- as.POSIXct(train$date, format = "%Y-%m-%d")
+
+train <- left_join(train, client %>% distinct(date, is_business, county, product_type, eic_count, installed_capacity), by = c("date", "is_business", "product_type", "county"))
+```
+
+## Merge gas to train
+```{r}
+gas_prices$date <- as.POSIXct(gas_prices$forecast_date, format = "%m/%d/%y")
+train <- left_join(train, gas_prices %>% distinct(date, lowest_price_per_mwh, highest_price_per_mwh), by = "date")
+```
+
+# Merge electricity to train
+```{r}
+electricity_prices <- read_csv("data/electricity_prices.csv")
+electricity_prices$datetime <- as.POSIXct(electricity_prices$forecast_date, format = "%m/%d/%y %H:%M")
+electricity_prices$datetime <- electricity_prices$datetime - hours(4) #fixes shift in data created by the merge
+train <- left_join(train, electricity_prices %>% distinct(datetime, euros_per_mwh), by = "datetime")
+```
+
+
+```{r}
+train <- na.omit(train)
+```
+
+31734 rows omitted of 2005872
+
+
+# Export sets
+
+```{r}
+write.csv(train, "/Users/kwallace/ISP_2024/data/train_set1.csv", row.names=FALSE)
+write.csv(test, "/Users/kwallace/ISP_2024/data/test_set1.csv", row.names=FALSE)
+#for use in other programs
+```
+
+
+# Machine Learning Models
+
+## Linear Regression
+
+### Looking at only energy consumption
+
+```{r}
+trainlm <- lm(target ~ as.factor(is_business) + temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = train[train$is_consumption == 1,])
+
+predicted <- predict(trainlm, newdata = test %>% filter(is_consumption == 1) %>% select(is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh, is_consumption))
+actual <- test[test$is_consumption == 1,]$target
+
+plot(actual ~ predicted)
+
+mae <- (1/length(actual))*sum(abs(actual - predicted)) #Mean absolute error
+mae
+
+```
+MAE = 451.6215
+
+### Looking at only energy consumption
+
+```{r}
+trainlm_p <- lm(target ~ as.factor(is_business) + as.factor(product_type)+ temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = train[train$is_consumption == 0,])
+
+predicted_p <- predict(trainlm_p, newdata = test %>% filter(is_consumption == 0) %>% select(is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh, is_consumption, product_type))
+
+actual_p <- test[test$is_consumption == 0,]$target
+
+mae_p <- (1/length(actual))*sum(abs(actual_p - predicted_p))
+mae_p
+
+
+
+```
+mae_p = 490
+
+### Scaling
+
+```{r}
+train2 <- scale(model.matrix(trainlm_p)[,-1], center = F)
+
+trainlm_p2 <- lm(train[train$is_consumption == 0,]$target ~ train2)
+summary(trainlm_p2) #to eliminate less useful predictors from the model
+```
+
+predictors with scaled estimate > 50:
+temperature, direct_solar_radiation, dewpoint, eic_count, installed_capacity
+
+#### Model with most significant predictors(from scaling)
+
+```{r}
+trainlm_p3 <- lm(target ~ temperature + direct_solar_radiation + dewpoint + eic_count + installed_capacity, data = train[train$is_consumption == 0,])
+
+predicted_p3 <- predict(trainlm_p3, newdata = test %>% filter(is_consumption == 0) %>% select(temperature, direct_solar_radiation, dewpoint, eic_count, installed_capacity))
+
+actual_p3 <- test[test$is_consumption == 0,]$target
+
+mae_p3 <- (1/length(actual))*sum(abs(actual_p3 - predicted_p3))
+mae_p3
+```
+
+
+## Model with is_consumption as a factor
+```{r}
+trainlm <- lm(target ~ as.factor(is_business) + as.factor(is_consumption) + temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = train)
+
+predicted <- predict(trainlm, newdata = test %>% select(is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh, is_consumption))
+
+actual <- test$target
+
+plot(actual ~ predicted)
+
+mae <- (1/length(actual))*sum(abs(actual - predicted))
+
+
+```
+
+mae = 460.047
+
+Doesn't show significant improvement
+
+## Transformations
+
+### With log transformation
+
+```{r}
+trainlm <- lm(log(target+0.5) ~ as.factor(is_business) + as.factor(is_consumption) + as.factor(product_type) + temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = train)
+
+predicted <- predict(trainlm, newdata = test %>% select(is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh, is_consumption, product_type))
+
+mae <- (1/length(actual))*sum(abs(actual - predicted))
+```
+
+mae = 390.6284
+
+Some improvement
+
+Note: is_consumption still treated as factor
+
+### With reciprocal transformation
+```{r}
+trainlm <- lm(1/(target+.5) ~ as.factor(is_business) + as.factor(is_consumption) + as.factor(product_type) + temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = train)
+
+predicted <- predict(trainlm, newdata = test %>% select(is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh, is_consumption, product_type))
+
+mae <- (1/length(actual))*sum(abs(actual - predicted))
+plot(trainlm, which = 1)
+```
+
+mae = 395.1988
+
+No improvement
+
+### With exponential
+```{r}
+trainlm <- lm(is.finite(exp(target)) ~ as.factor(is_business) + as.factor(is_consumption) + as.factor(product_type) + temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = train)
+
+predicted <- predict(trainlm, newdata = test %>% select(is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh, is_consumption, product_type))
+
+mae <- (1/length(actual))*sum(abs(actual - predicted))
+```
+
+mae = 721.2031
+
+Considerably worse
+
+
+## Random Forest Model
+
+```{r}
+#generate random smaller train set, since full set exceeds memory limit
+set.seed(43)
+production <- train[train$is_consumption ==1,]
+small_index <- sample(nrow(train), size = 50000)  
+small_train <- train[small_index, ]
+
+trainrf <- randomForest(target ~ is_consumption + is_business + temperature + direct_solar_radiation + total_precipitation + dewpoint + eic_count + installed_capacity + lowest_price_per_mwh + euros_per_mwh, data = small_train)
+
+predicted <- predict(trainrf, newdata = test %>% select(is_consumption, is_business, temperature,direct_solar_radiation, total_precipitation, dewpoint, eic_count, installed_capacity, lowest_price_per_mwh, euros_per_mwh))
+
+actual = test$target
+
+mae <- (1/length(actual))*sum(abs(actual - predicted))
+```
+
+mae = 262.1787
+
+Given that this resulting Mean Absolute Error is higher than when following the same process for Merge Version 2, further refining of the model will be done using the Merge V2 sets.
+
+
+
